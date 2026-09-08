@@ -116,6 +116,8 @@ def oss_cli_args(args) -> list[str]:
         "--endpoint", args.endpoint,
         "--prefix", args.prefix,
         "--workers", str(args.workers),
+        "--retries", str(args.retries),
+        "--retry-backoff", str(args.retry_backoff),
     ]
     if args.skip_existing:
         out.append("--skip-existing")
@@ -333,6 +335,8 @@ def build_parser():
     p.add_argument("--endpoint", type=str, default=cfg.OSS_ENDPOINT)
     p.add_argument("--prefix", type=str, default=cfg.OSS_PREFIX)
     p.add_argument("--workers", type=int, default=cfg.WORKERS)
+    p.add_argument("--retries", type=int, default=cfg.RETRIES, help=f"OSS attempts per file (default: {cfg.RETRIES})")
+    p.add_argument("--retry-backoff", type=float, default=cfg.RETRY_BACKOFF_SEC)
     p.add_argument(
         "--skip-existing",
         action="store_true",

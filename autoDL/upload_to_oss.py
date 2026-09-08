@@ -95,51 +95,106 @@ def has_remote_objects(bucket, prefix: str) -> bool:
     return False
 
 
-def upload_one(bucket, local: Path, key: str, multipart_threshold: int, part_size: int, skip_existing: bool):
-    if skip_existing and bucket.object_exists(key):
-        remote_size = bucket.head_object(key).content_length
-        local_size = local.stat().st_size
-        if remote_size == local_size:
-            return "skip", local, key, local_size, 0.0
-
-    size = local.stat().st_size
-    t0 = time.time()
-    if size >= multipart_threshold:
-        oss2 = _require_oss2()
-        oss2.resumable_upload(
-            bucket,
-            key,
-            str(local),
-            multipart_threshold=multipart_threshold,
-            part_size=part_size,
-            num_threads=4,
-        )
-    else:
-        bucket.put_object_from_file(key, str(local))
-    dt = time.time() - t0
-    return "ok", local, key, size, dt
+def _retry_call(fn, *, retries: int, backoff_sec: float, what: str):
+    """Run fn(); on failure retry up to `retries` times with exponential backoff."""
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            return fn()
+        except Exception as e:
+            last_err = e
+            if attempt >= retries:
+                break
+            wait = backoff_sec * (2 ** (attempt - 1))
+            print(
+                f"[RETRY] {what} attempt {attempt}/{retries} failed: {e}; sleep {wait:.1f}s",
+                file=sys.stderr,
+            )
+            time.sleep(wait)
+    raise last_err
 
 
-def download_one(bucket, local: Path, key: str, size: int, multipart_threshold: int, part_size: int, skip_existing: bool):
-    if skip_existing and local.is_file() and local.stat().st_size == size:
-        return "skip", local, key, size, 0.0
+def upload_one(
+    bucket,
+    local: Path,
+    key: str,
+    multipart_threshold: int,
+    part_size: int,
+    skip_existing: bool,
+    retries: int = cfg.RETRIES,
+    backoff_sec: float = cfg.RETRY_BACKOFF_SEC,
+):
+    def _do():
+        if skip_existing and bucket.object_exists(key):
+            remote_size = bucket.head_object(key).content_length
+            local_size = local.stat().st_size
+            if remote_size == local_size:
+                return "skip", local, key, local_size, 0.0
 
-    local.parent.mkdir(parents=True, exist_ok=True)
-    t0 = time.time()
-    if size >= multipart_threshold:
-        oss2 = _require_oss2()
-        oss2.resumable_download(
-            bucket,
-            key,
-            str(local),
-            multiget_threshold=multipart_threshold,
-            part_size=part_size,
-            num_threads=4,
-        )
-    else:
-        bucket.get_object_to_file(key, str(local))
-    dt = time.time() - t0
-    return "ok", local, key, size, dt
+        size = local.stat().st_size
+        t0 = time.time()
+        if size >= multipart_threshold:
+            oss2 = _require_oss2()
+            oss2.resumable_upload(
+                bucket,
+                key,
+                str(local),
+                multipart_threshold=multipart_threshold,
+                part_size=part_size,
+                num_threads=4,
+            )
+        else:
+            bucket.put_object_from_file(key, str(local))
+        dt = time.time() - t0
+        return "ok", local, key, size, dt
+
+    return _retry_call(_do, retries=retries, backoff_sec=backoff_sec, what=f"upload {key}")
+
+
+def download_one(
+    bucket,
+    local: Path,
+    key: str,
+    size: int,
+    multipart_threshold: int,
+    part_size: int,
+    skip_existing: bool,
+    retries: int = cfg.RETRIES,
+    backoff_sec: float = cfg.RETRY_BACKOFF_SEC,
+):
+    def _do():
+        if skip_existing and local.is_file() and local.stat().st_size == size:
+            return "skip", local, key, size, 0.0
+
+        local.parent.mkdir(parents=True, exist_ok=True)
+        # avoid leaving a truncated file on failure for simple get_object_to_file
+        tmp_path = local.with_suffix(local.suffix + ".tmp")
+        t0 = time.time()
+        try:
+            if size >= multipart_threshold:
+                oss2 = _require_oss2()
+                oss2.resumable_download(
+                    bucket,
+                    key,
+                    str(local),
+                    multiget_threshold=multipart_threshold,
+                    part_size=part_size,
+                    num_threads=4,
+                )
+            else:
+                bucket.get_object_to_file(key, str(tmp_path))
+                os.replace(tmp_path, local)
+        except Exception:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+            raise
+        dt = time.time() - t0
+        return "ok", local, key, size, dt
+
+    return _retry_call(_do, retries=retries, backoff_sec=backoff_sec, what=f"download {key}")
 
 
 def run_jobs(jobs, workers: int, total_bytes: int, ok_label: str):
@@ -194,6 +249,7 @@ def cmd_upload(args, bucket):
     print(f"Remote : {remote}")
     print(f"Files  : {len(files)} ({human_size(total_bytes)})")
     print(f"Workers: {args.workers}")
+    print(f"Retries: {args.retries}")
 
     if args.dry_run:
         for path in files:
@@ -212,6 +268,8 @@ def cmd_upload(args, bucket):
                 args.multipart_threshold,
                 args.part_size,
                 args.skip_existing,
+                args.retries,
+                args.retry_backoff,
             ),
         )
         for path in files
@@ -223,7 +281,15 @@ def cmd_download(args, bucket):
     local_root = Path(args.local).expanduser().resolve()
     local_root.mkdir(parents=True, exist_ok=True)
 
-    objects = list(list_remote_objects(bucket, args.prefix))
+    def _list():
+        return list(list_remote_objects(bucket, args.prefix))
+
+    objects = _retry_call(
+        _list,
+        retries=args.retries,
+        backoff_sec=args.retry_backoff,
+        what=f"list oss://{args.bucket}/{normalize_prefix(args.prefix)}",
+    )
     if not objects:
         print(f"No objects under oss://{args.bucket}/{normalize_prefix(args.prefix)}")
         return
@@ -235,6 +301,7 @@ def cmd_download(args, bucket):
     print(f"Local  : {local_root}")
     print(f"Files  : {len(objects)} ({human_size(total_bytes)})")
     print(f"Workers: {args.workers}")
+    print(f"Retries: {args.retries}")
 
     if args.dry_run:
         for key, size in objects:
@@ -254,6 +321,8 @@ def cmd_download(args, bucket):
                 args.multipart_threshold,
                 args.part_size,
                 args.skip_existing,
+                args.retries,
+                args.retry_backoff,
             ),
         )
         for key, size in objects
@@ -297,6 +366,13 @@ def build_parser():
         help=f"from env {cfg.OSS_SK_ENV}",
     )
     parser.add_argument("--workers", type=int, default=cfg.WORKERS)
+    parser.add_argument("--retries", type=int, default=cfg.RETRIES, help=f"attempts per file (default: {cfg.RETRIES})")
+    parser.add_argument(
+        "--retry-backoff",
+        type=float,
+        default=cfg.RETRY_BACKOFF_SEC,
+        help=f"base seconds for exponential backoff (default: {cfg.RETRY_BACKOFF_SEC})",
+    )
     parser.add_argument("--multipart-threshold", type=int, default=cfg.MULTIPART_THRESHOLD)
     parser.add_argument("--part-size", type=int, default=cfg.PART_SIZE)
     parser.add_argument(

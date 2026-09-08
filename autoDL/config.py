@@ -70,3 +70,5 @@ WORKERS = 8
 SKIP_EXISTING = True
 MULTIPART_THRESHOLD = 100 * 1024 * 1024
 PART_SIZE = 16 * 1024 * 1024
+RETRIES = 5  # attempts per file (upload/download)
+RETRY_BACKOFF_SEC = 2.0  # exponential: 2, 4, 8, ...
