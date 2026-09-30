@@ -1,13 +1,14 @@
 .venv/
 __pycache__/
 *.pyc
-dev-ignore/
-report.md
-eval_bundle/
+.vscode/
 
-# Secrets
-.env
+# Rust
+rust-bpe/target/
 
-# Local setup
-CLAUDE.md
-wandb/
+# Pretok dumps (word text / count / length)
+word_counts.tsv
+rust-bpe/word_counts.tsv
+*.tsv
+# Tokenizer artifacts (vocab.json, *.tiktoken)
+local/

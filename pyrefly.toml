@@ -1,0 +1,2 @@
+# Use the project uv venv; relative path so it isn't machine-specific.
+python-interpreter-path = "./.venv/bin/python"

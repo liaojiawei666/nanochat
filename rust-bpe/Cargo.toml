@@ -1,0 +1,12 @@
+[package]
+name = "rust-bpe"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ahash = "0.8.12"
+arrow = "60.0.0"
+parquet = "60.0.0"
+rayon = "1.12.0"
+fancy-regex = "0.16"
+base64 = "0.22"
