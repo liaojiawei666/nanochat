@@ -21,3 +21,7 @@ default = true
 # name = "aliyun"
 # url = "https://mirrors.aliyun.com/pypi/simple"
 # default = true
+
+[tool.black]
+line-length = 120
+target-version = ["py312"]

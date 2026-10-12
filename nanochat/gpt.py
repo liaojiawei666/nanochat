@@ -3,8 +3,8 @@ from torch import Tensor
 from torch import nn
 import torch.nn.functional as F
 
-# 累计训练 token ≈ ratio × 参数量（对齐 nanochat 量级，可再调）
-TOKEN_PARAM_RATIO = 8
+from nanochat.optim import AdamWGroup, MuonGroup, ParamGroup
+
 
 
 class GPTConfig:
@@ -18,16 +18,6 @@ class GPTConfig:
         self.softcap = 15
         self.n_embd = self.aspect_ratio * self.n_layer
         self.n_kv_head = self.n_embd // self.head_dim
-        n_atten_params = 2 * self.n_embd**2 + 2 * self.n_embd * (
-            self.n_kv_head * self.head_dim
-        )
-        n_mlp_params = 2 * self.n_embd * (4 * self.n_embd)
-        n_lm_head_params = self.n_embd * self.vocab_size
-        # 不计算wte，ve，rope等参数
-        self.n_scalar_params = (
-            n_layer * (n_mlp_params + n_atten_params) + n_lm_head_params
-        )
-        self.n_tokens = TOKEN_PARAM_RATIO * self.n_scalar_params
 
 
 class MLP(nn.Module):
@@ -48,9 +38,7 @@ def norm(x: Tensor) -> Tensor:
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(
-        self, n_embd: int, head_dim: int, n_kv_head: int, has_ve: bool = False
-    ) -> None:
+    def __init__(self, n_embd: int, head_dim: int, n_kv_head: int, has_ve: bool = False) -> None:
         super().__init__()
         self.head_dim = head_dim
         self.W_q = nn.Linear(n_embd, n_embd, bias=False)
@@ -71,9 +59,7 @@ class CausalSelfAttention(nn.Module):
         y2 = x1 * sin + x2 * cos
         return torch.concat((y1, y2), dim=-1)
 
-    def forward(
-        self, x: Tensor, cos: Tensor, sin: Tensor, ve: Tensor | None = None
-    ) -> Tensor:
+    def forward(self, x: Tensor, cos: Tensor, sin: Tensor, ve: Tensor | None = None) -> Tensor:
         # x:[B,T,n_embd]
         B, T, _ = x.shape
         # q:[B,T,n_head,head_dim]
@@ -102,16 +88,12 @@ class CausalSelfAttention(nn.Module):
 
 
 class TranformerBlock(nn.Module):
-    def __init__(
-        self, n_embd: int, head_dim: int, n_kv_head: int, has_ve: bool = False
-    ) -> None:
+    def __init__(self, n_embd: int, head_dim: int, n_kv_head: int, has_ve: bool = False) -> None:
         super().__init__()
         self.atten = CausalSelfAttention(n_embd, head_dim, n_kv_head, has_ve)
         self.mlp = MLP(n_embd)
 
-    def forward(
-        self, x: Tensor, cos: Tensor, sin: Tensor, ve: Tensor | None = None
-    ) -> Tensor:
+    def forward(self, x: Tensor, cos: Tensor, sin: Tensor, ve: Tensor | None = None) -> Tensor:
         x = x + self.atten(norm(x), cos, sin, ve)
         x = x + self.mlp(norm(x))
         return x
@@ -122,7 +104,19 @@ def has_ve(layer_idx: int, n_layer: int) -> bool:
     return layer_idx % 2 == (n_layer - 1) % 2
 
 
+class Transformer(nn.Module):
+    def __init__(self, vocab_size: int, n_embd: int, head_dim: int, n_kv_head: int, n_layer: int) -> None:
+        super().__init__()
+        self.wte = nn.Embedding(vocab_size, n_embd)
+        self.h = nn.ModuleList(
+            [TranformerBlock(n_embd, head_dim, n_kv_head, has_ve=has_ve(i, n_layer)) for i in range(n_layer)]
+        )
+
+
 class GPT(nn.Module):
+    cos: Tensor
+    sin: Tensor
+
     def __init__(
         self,
         sequence_len: int,
@@ -138,21 +132,17 @@ class GPT(nn.Module):
         self.n_layer = n_layer
         kv_dim = n_kv_head * head_dim
 
-        self.wte = nn.Embedding(vocab_size, n_embd)
-        self.blocks = nn.ModuleList(
-            [
-                TranformerBlock(n_embd, head_dim, n_kv_head, has_ve=has_ve(i, n_layer))
-                for i in range(n_layer)
-            ]
-        )
+        self.transformer = Transformer(vocab_size, n_embd, head_dim, n_kv_head, n_layer)
         # 每层（若启用）一张表：token id → value 向量
         self.value_embeds = nn.ModuleDict(
-            {
-                str(i): nn.Embedding(vocab_size, kv_dim)
-                for i in range(n_layer)
-                if has_ve(i, n_layer)
-            }
+            {str(i): nn.Embedding(vocab_size, kv_dim) for i in range(n_layer) if has_ve(i, n_layer)}
         )
+        # 每层一个标量：混入初始 embedding；真实初值可在 init_weights 里再设
+        self.x0_lambdas = nn.Parameter(torch.zeros(n_layer))
+        self.resid_lambdas = nn.Parameter(torch.ones(n_layer))
+        # Smear：全局一份，用前一 token 的 embedding 混进当前位（廉价 bigram）
+        self.smear_gate = nn.Linear(24, 1, bias=False)
+        self.smear_lambda = nn.Parameter(torch.zeros(1))
 
         cos, sin = self._precompute_rope()
         self.register_buffer("cos", cos, persistent=False)
@@ -171,6 +161,76 @@ class GPT(nn.Module):
         sin = sin[None, :, None, :]
         return cos, sin
 
+    def param_counts(self) -> dict:
+        """返回各模块参数量。"""
+
+        def nparams(module: nn.Module | nn.Parameter) -> int:
+            if isinstance(module, nn.Parameter):
+                return module.numel()
+            return sum(p.numel() for p in module.parameters())
+
+        counts = {
+            "wte": nparams(self.transformer.wte),
+            "transform_matrix": nparams(self.transformer.h),
+            "value_embeds": nparams(self.value_embeds),
+            "resid_lambdas": nparams(self.resid_lambdas),
+            "x0_lambdas": nparams(self.x0_lambdas),
+            "smear_gate": nparams(self.smear_gate),
+            "smear_lambda": nparams(self.smear_lambda),
+            "lm_head": nparams(self.lm_head),
+        }
+        counts["total"] = nparams(self)
+        return counts
+
+    def set_optim(self):
+        param_groups: list[ParamGroup] = [
+            AdamWGroup(
+                kind="adamw",
+                params=list(self.transformer.wte.parameters()),
+                lr=0.01,
+                betas=(0.8, 0.96),
+                eps=1e-10,
+                weight_decay=0.1,
+            ),
+            AdamWGroup(
+                kind="adamw",
+                params=list(self.value_embeds.parameters()),
+                lr=0.01,
+                betas=(0.8, 0.96),
+                eps=1e-10,
+                weight_decay=0.1,
+            ),
+            AdamWGroup(
+                kind="adamw",
+                params=list(self.lm_head.parameters()),
+                lr=0.01,
+                betas=(0.8, 0.96),
+                eps=1e-10,
+                weight_decay=0.1,
+            ),
+            AdamWGroup(
+                kind="adamw", params=[self.resid_lambdas], lr=0.01, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.1
+            ),
+            AdamWGroup(kind="adamw", params=[self.x0_lambdas], lr=0.01, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.1),
+            AdamWGroup(
+                kind="adamw",
+                params=list(self.smear_gate.parameters()),
+                lr=0.01,
+                betas=(0.8, 0.96),
+                eps=1e-10,
+                weight_decay=0.1,
+            ),
+            AdamWGroup(
+                kind="adamw", params=[self.smear_lambda], lr=0.01, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.1
+            ),
+        ]
+        matrix_params = list(self.transformer.h.parameters())
+        for shape in sorted({p.shape for p in matrix_params}):
+            group_params = [p for p in matrix_params if p.shape == shape]
+            param_groups.append(
+                MuonGroup(kind="muon", params=group_params, lr=0.02, beta=0.95, eps=1e-10, ns_steps=5, weight_decay=0.0)
+            )
+
     def forward(self, idx: Tensor) -> Tensor:
         # idx: (B, T) token ids
         B, T = idx.shape
@@ -178,10 +238,20 @@ class GPT(nn.Module):
         cos = self.cos[:, :T]
         sin = self.sin[:, :T]
 
-        x = self.wte(idx)  # (B, T, n_embd)
-        for i, block in enumerate(self.blocks):
+        x = norm(self.transformer.wte(idx))  # (B, T, n_embd)
+        # smear：位置 0 不动；1..T-1 混入上一个 token
+        assert T > 1
+        gate = self.smear_lambda * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
+        x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
+
+        x0 = x
+        for i, block in enumerate(self.transformer.h):
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             x = block(x, cos, sin, ve)
         x = norm(x)
         logits = self.lm_head(x)
         return logits
+
+
+

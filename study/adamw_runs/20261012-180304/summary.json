@@ -1,0 +1,22 @@
+{
+  "all_steps": {
+    "steps": 500,
+    "pearson_g_dot_u_vs_loss_drop": 0.9819740496864655,
+    "pearson_prediction_vs_loss_drop": 0.9819740496864653,
+    "mean_loss_drop": 0.04933375263214111,
+    "fraction_loss_decreased": 1.0,
+    "prediction_mean_absolute_error": 0.003879901612851592,
+    "mean_actual_minus_predicted": -0.003844590785323864
+  },
+  "after_warmup": {
+    "steps": 480,
+    "pearson_g_dot_u_vs_loss_drop": 0.9708563585878023,
+    "pearson_prediction_vs_loss_drop": 0.9708563585878021,
+    "mean_loss_drop": 0.046537038683891294,
+    "fraction_loss_decreased": 1.0,
+    "prediction_mean_absolute_error": 0.0029188572346510455,
+    "mean_actual_minus_predicted": -0.0028820751226429956
+  },
+  "warmup_excluded_steps": 20,
+  "peak_cuda_memory_mib": 326.2890625
+}
