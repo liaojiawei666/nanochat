@@ -12,3 +12,5 @@ rust-bpe/word_counts.tsv
 *.tsv
 # Tokenizer artifacts (vocab.json, *.tiktoken)
 local/
+data/
+env*

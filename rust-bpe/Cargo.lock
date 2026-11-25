@@ -917,6 +917,7 @@ dependencies = [
  "fancy-regex",
  "parquet",
  "rayon",
+ "serde_json",
 ]
 
 [[package]]

@@ -1,7 +1,7 @@
 """小 GPT：对比 AdamW 每一步的预测损失下降、实际下降及两者之差。
 
 运行：.venv/bin/python study/adamw.py
-数据：已编码的小端 uint16 token 分片，默认 ~/.cache/nanochat/tokenized_climbmix。
+数据：已编码的小端 uint16 token 分片，默认 data/pretrain/climbmix/tokenized。
 u = m_hat / (sqrt(v_hat) + eps)，g 是当前 batch 的原始梯度。
 """
 
@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib
 import json
 import math
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Callable, overload
 
 import numpy as np
 import torch
@@ -78,8 +80,13 @@ class SmallGPT(nn.Module):
         self.ln = nn.LayerNorm(config.n_embd)
         self.apply(self._init_weights)
         for block in self.blocks:
+            if not isinstance(block, Block):
+                raise TypeError("blocks must contain Block modules")
+            projection = block.mlp[-1]
+            if not isinstance(projection, nn.Linear):
+                raise TypeError("MLP must end with a linear projection")
             nn.init.normal_(block.attn.proj.weight, std=0.02 / math.sqrt(2 * config.n_layer))
-            nn.init.normal_(block.mlp[-1].weight, std=0.02 / math.sqrt(2 * config.n_layer))
+            nn.init.normal_(projection.weight, std=0.02 / math.sqrt(2 * config.n_layer))
 
     @staticmethod
     def _init_weights(module):
@@ -147,8 +154,27 @@ class MeasuredAdamW(torch.optim.Optimizer):
             raise ValueError("weight_decay 必须非负，betas 必须在 [0, 1) 内")
         super().__init__(params, dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay))
 
+    @overload
+    def step(self, closure: None = None) -> None: ...
+
+    @overload
+    def step(self, closure: Callable[[], float]) -> float: ...
+
+    @overload
+    def step(self, closure: Callable[[], torch.Tensor]) -> torch.Tensor: ...
+
     @torch.no_grad()
-    def step(self):
+    def step(self, closure: Callable[[], float | torch.Tensor] | None = None) -> float | torch.Tensor | None:
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        self.step_with_metrics()
+        return loss
+
+    @torch.no_grad()
+    def step_with_metrics(self) -> dict[str, float]:
+        """执行一次更新并返回实验指标；step 保持 PyTorch 优化器接口。"""
         totals = None
         for group in self.param_groups:
             lr, wd, eps = group["lr"], group["weight_decay"], group["eps"]
@@ -185,7 +211,7 @@ class MeasuredAdamW(torch.optim.Optimizer):
         if not torch.isfinite(totals).all().item():
             raise FloatingPointError("梯度或 AdamW 统计出现 NaN/Inf，请减小学习率")
         names = ("grad_l1", "g_dot_u", "predicted_adam_drop", "predicted_decay_drop")
-        metrics = dict(zip(names, totals.tolist()))
+        metrics: dict[str, float] = dict(zip(names, totals.tolist()))
         metrics["predicted_loss_drop"] = metrics["predicted_adam_drop"] + metrics["predicted_decay_drop"]
         return metrics
 
@@ -222,9 +248,10 @@ def summarize(rows):
 
 def plot_metrics(rows, output):
     try:
-        import matplotlib
+        # 绘图为可选依赖，仅运行绘图时加载。
+        matplotlib = importlib.import_module("matplotlib")
         matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
+        plt = importlib.import_module("matplotlib.pyplot")
     except ModuleNotFoundError:
         print("未安装 matplotlib，已保存 CSV 和统计；安装后可用 --plot-csv 单独绘图。", flush=True)
         return
@@ -250,8 +277,8 @@ def plot_metrics(rows, output):
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--data", type=Path, default=Path.home() / ".cache/nanochat/tokenized_climbmix")
-    parser.add_argument("--out", type=Path, default=Path("study/adamw_runs") / time.strftime("%Y%m%d-%H%M%S"))
+    parser.add_argument("--data", type=Path, default=Path("data/pretrain/climbmix/tokenized"))
+    parser.add_argument("--out", type=Path, default=Path("data/runs") / time.strftime("adamw-%Y%m%d-%H%M%S"))
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seq-len", type=int, default=128)
@@ -326,7 +353,7 @@ def main():
             loss.backward()
             before = loss.item()
             del loss
-            metrics = optimizer.step()
+            metrics = optimizer.step_with_metrics()
             with torch.no_grad():
                 after = model(x, y).item()  # 必须复用同一批 x/y；不能比较下一个 batch。
             if not math.isfinite(after):

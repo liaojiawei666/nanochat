@@ -1,5 +1,5 @@
 use std::{
-    collections::BinaryHeap,
+    collections::{BTreeMap, BTreeSet},
     fs::File,
     io::{BufRead, BufReader},
     path::Path,
@@ -7,53 +7,16 @@ use std::{
 
 use ahash::AHashMap;
 use base64::Engine;
-use fancy_regex::Regex;
 
 use crate::bpe::TokenId;
-use crate::special::{GPT4_PATTERN, SpecialToken};
+use crate::bpe::pretok::Pretokenizer;
 
 /// tiktoken 风格：`bytes → rank`（rank 即 token id / 合并优先级）。
 type MergeableRanks = AHashMap<Vec<u8>, TokenId>;
 
 pub struct BpeEncoder {
     ranks: MergeableRanks,
-    pattern: Regex,
-}
-
-/// 链表节点下标（合并后仍指向该段第一个字节的下标）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct NodeId(usize);
-
-/// 堆中的待合并相邻段；`rank` 越小越优先。
-#[derive(Debug, PartialEq, Eq)]
-struct MergeCandidate {
-    left: NodeId,
-    right: NodeId,
-    rank: TokenId,
-}
-
-impl Ord for MergeCandidate {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // BinaryHeap 是大根堆：反过来比 => rank 小的优先；同 rank 时 left 小的优先
-        other
-            .rank
-            .cmp(&self.rank)
-            .then_with(|| other.left.cmp(&self.left))
-            .then_with(|| other.right.cmp(&self.right))
-    }
-}
-
-impl PartialOrd for MergeCandidate {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-struct TokenNode {
-    alive: bool,
-    token_id: TokenId,
-    prev: Option<NodeId>,
-    next: Option<NodeId>,
+    pretokenizer: Pretokenizer,
 }
 
 impl BpeEncoder {
@@ -73,115 +36,104 @@ impl BpeEncoder {
         }
         Self {
             ranks,
-            pattern: Regex::new(GPT4_PATTERN).unwrap(),
+            pretokenizer: Pretokenizer::new(),
         }
     }
 
+    /// 仅编码正文；相同片段在文档内编码一次，再按原文顺序拼接。
     pub fn encode(&self, doc: &str) -> Vec<TokenId> {
-        let words: Vec<&str> = self
-            .pattern
-            .find_iter(doc)
-            .map(|m| m.expect("regex match failed").as_str())
-            .collect();
-        let mut token_ids: Vec<TokenId> = Vec::new();
-        token_ids.push(SpecialToken::Bos.id());
-        for word in words {
-            token_ids.extend(self.encode_word(word));
+        let mut word_tokens: AHashMap<&str, Vec<TokenId>> = AHashMap::new();
+        let mut token_ids = Vec::new();
+        for word in self.pretokenizer.split(doc) {
+            let ids = word_tokens
+                .entry(word)
+                .or_insert_with(|| self.encode_word(word));
+            token_ids.extend_from_slice(ids);
         }
         token_ids
     }
 
     fn encode_word(&self, word: &str) -> Vec<TokenId> {
-        let bytes: Vec<u8> = word.bytes().collect();
-        let total_bytes = bytes.len();
-        if total_bytes == 0 {
-            return Vec::new();
+        let bytes = word.as_bytes();
+        // 起点 → 终点，按原文位置排列当前片段。
+        let mut parts: BTreeMap<usize, usize> = (0..bytes.len()).map(|i| (i, i + 1)).collect();
+        // (rank, 起点)：最小 rank 优先，同 rank 时最左优先。
+        let mut candidates = BTreeSet::new();
+        for &start in parts.keys() {
+            if let Some(candidate) = self.pair_candidate(bytes, &parts, start) {
+                candidates.insert(candidate);
+            }
         }
 
-        let mut pair_heap: BinaryHeap<MergeCandidate> = BinaryHeap::new();
-        let mut nodes: Vec<TokenNode> = Vec::with_capacity(total_bytes);
+        while let Some((_, left)) = candidates.pop_first() {
+            let right = parts[&left];
+            let end = parts[&right];
+            let previous = parts.range(..left).next_back().map(|(&start, _)| start);
 
-        for i in 0..total_bytes {
-            let mut node = TokenNode {
-                token_id: bytes[i] as TokenId,
-                prev: None,
-                next: None,
-                alive: true,
-            };
-            if i > 0 {
-                node.prev = Some(NodeId(i - 1));
-            }
-            if i + 1 < total_bytes {
-                node.next = Some(NodeId(i + 1));
-                if let Some(&rank) = self.ranks.get(&bytes[i..i + 2]) {
-                    pair_heap.push(MergeCandidate {
-                        left: NodeId(i),
-                        right: NodeId(i + 1),
-                        rank,
-                    });
-                }
-            }
-            nodes.push(node);
-        }
-
-        while let Some(MergeCandidate {
-            left,
-            right,
-            rank,
-        }) = pair_heap.pop()
-        {
-            if !(nodes[left.0].alive
-                && nodes[right.0].alive
-                && nodes[left.0].next == Some(right))
-            {
-                continue;
-            }
-
-            let byte_end = nodes[right.0].next.map_or(total_bytes, |n| n.0);
-            match self.ranks.get(&bytes[left.0..byte_end]) {
-                Some(&r) if r == rank => {}
-                _ => continue,
-            }
-
-            nodes[right.0].alive = false;
-            nodes[left.0].token_id = rank;
-            let new_right_node_id = nodes[right.0].next;
-            nodes[left.0].next = new_right_node_id;
-
-            if let Some(new_right) = new_right_node_id {
-                nodes[new_right.0].prev = Some(left);
-                let pair_byte_end = nodes[new_right.0].next.map_or(total_bytes, |n| n.0);
-                if let Some(&tok) = self.ranks.get(&bytes[left.0..pair_byte_end]) {
-                    pair_heap.push(MergeCandidate {
-                        left,
-                        right: new_right,
-                        rank: tok,
-                    });
+            // 合并 B、C 前删除 AB、CD；BC 已由 pop_first 取出。
+            for start in [previous, Some(right)].into_iter().flatten() {
+                if let Some(candidate) = self.pair_candidate(bytes, &parts, start) {
+                    candidates.remove(&candidate);
                 }
             }
 
-            if let Some(prev_left) = nodes[left.0].prev {
-                let pair_byte_end = nodes[left.0].next.map_or(total_bytes, |n| n.0);
-                if let Some(&tok) = self.ranks.get(&bytes[prev_left.0..pair_byte_end]) {
-                    pair_heap.push(MergeCandidate {
-                        left: prev_left,
-                        right: left,
-                        rank: tok,
-                    });
+            parts.insert(left, end);
+            parts.remove(&right);
+
+            // 合并后添加 A(BC)、(BC)D，其余候选不变。
+            for start in [previous, Some(left)].into_iter().flatten() {
+                if let Some(candidate) = self.pair_candidate(bytes, &parts, start) {
+                    candidates.insert(candidate);
                 }
             }
         }
 
-        let mut token_ids = Vec::new();
-        let mut pos = NodeId(0);
-        loop {
-            token_ids.push(nodes[pos.0].token_id);
-            match nodes[pos.0].next {
-                Some(n) => pos = n,
-                None => break,
-            }
-        }
-        token_ids
+        parts
+            .into_iter()
+            .map(|(start, end)| self.ranks[&bytes[start..end]])
+            .collect()
+    }
+
+    fn pair_candidate(
+        &self,
+        bytes: &[u8],
+        parts: &BTreeMap<usize, usize>,
+        start: usize,
+    ) -> Option<(TokenId, usize)> {
+        let right = *parts.get(&start)?;
+        let end = *parts.get(&right)?;
+        self.ranks
+            .get(&bytes[start..end])
+            .map(|&rank| (rank, start))
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encoder(merges: &[&[u8]]) -> BpeEncoder {
+        let mut ranks: MergeableRanks = (0u16..256)
+            .map(|id| (vec![id as u8], id as TokenId))
+            .collect();
+        for (index, bytes) in merges.iter().enumerate() {
+            ranks.insert(bytes.to_vec(), 256 + index as TokenId);
+        }
+        BpeEncoder {
+            ranks,
+            pretokenizer: Pretokenizer::new(),
+        }
+    }
+
+    #[test]
+    fn merging_middle_pair_updates_both_neighbors() {
+        let encoder = encoder(&[b"bc", b"ab", b"cd", b"abc", b"bcd", b"abcd"]);
+        assert_eq!(encoder.encode_word("abcd"), [261]);
+    }
+
+    #[test]
+    fn equal_rank_merges_choose_leftmost_pair() {
+        let encoder = encoder(&[b"aa", b"aaa"]);
+        assert_eq!(encoder.encode_word("aaaaa"), [256, 257]);
+    }
+}

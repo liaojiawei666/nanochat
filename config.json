@@ -1,0 +1,35 @@
+{
+  "model": {
+    "n_layer": 24,
+    "sequence_len": 2048,
+    "head_dim": 128,
+    "aspect_ratio": 64
+  },
+  "storage": {
+    "data_dir": "data/pretrain/climbmix/tokenized",
+    "archive_path": "data/pretrain/climbmix/data.tar.zst"
+  },
+  "train": {
+    "output_dir": "data/runs/run-d24",
+    "micro_batch": 1,
+    "token_param_ratio": 8.0,
+    "dtype": "auto",
+    "eval_every": 100,
+    "eval_batches": 32,
+    "log_every": 10
+  },
+  "platforms": {
+    "AutoDL": {
+      "project_dir": "/root/nanochat",
+      "shared_dir": "/root/autodl-fs",
+      "data_root": "/root/autodl-tmp/nanochat",
+      "archive_path": "/root/autodl-fs/nanochat/data/pretrain/climbmix/data.tar.zst"
+    },
+    "DAMODEL": {
+      "project_dir": "/root/nanochat",
+      "shared_dir": "/root/shared-storage",
+      "data_root": "/root/workspace/nanochat",
+      "archive_path": "/root/shared-storage/nanochat/data/pretrain/climbmix/data.tar.zst"
+    }
+  }
+}

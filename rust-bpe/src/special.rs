@@ -1,5 +1,3 @@
-pub const GPT4_PATTERN: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+";
-
 /// 文档分隔和微调对话用的特殊 token。声明顺序就是 id 顺序。
 #[derive(Clone, Copy)]
 pub enum SpecialToken {

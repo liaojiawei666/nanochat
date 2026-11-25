@@ -1,6 +1,5 @@
 use ahash::{AHashMap, AHashSet};
 use base64::Engine;
-use fancy_regex::Regex;
 use rayon::prelude::*;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -8,24 +7,21 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
+use crate::bpe::pretok::Pretokenizer;
 use crate::bpe::{Pair, TokenId};
-use crate::dataset::{Dataset, DatasetOptions};
 
-/// 对单篇文档做 GPT-4 风格 pretok，返回片段 → 出现次数。
-fn pretok(doc: &str, re: &Regex) -> AHashMap<String, i64> {
-    let mut h = AHashMap::new();
-    for m in re.find_iter(doc) {
-        let s = m.expect("regex match failed").as_str();
-        *h.entry(s.to_string()).or_insert(0) += 1;
-    }
-    h
-}
-
-/// 在指定选项下的 parquet 文档上统计 pretok 片段全局频次。
-pub fn count_pretok_strs(options: DatasetOptions, pattern: &Regex) -> AHashMap<String, i64> {
-    Dataset::new(options)
+/// 在调用方提供的文档迭代器上统计 pretok 片段全局频次。
+fn count_pretok_strs(documents: impl Iterator<Item = String> + Send) -> AHashMap<String, i64> {
+    let pretokenizer = Pretokenizer::new();
+    documents
         .par_bridge()
-        .map(|sample| pretok(&sample.text, pattern))
+        .map(|text| {
+            let mut counts = AHashMap::new();
+            for piece in pretokenizer.split(&text) {
+                *counts.entry(piece.to_string()).or_insert(0) += 1;
+            }
+            counts
+        })
         .reduce(AHashMap::new, |mut acc, local| {
             for (word, n) in local {
                 *acc.entry(word).or_insert(0) += n;
@@ -143,8 +139,9 @@ pub struct BpeTrainer {
 }
 
 impl BpeTrainer {
-    pub fn from_str_counts(str_count: &AHashMap<String, i64>) -> Self {
-        let words = build_words(str_count);
+    pub fn from_documents(documents: impl Iterator<Item = String> + Send) -> Self {
+        let str_count = count_pretok_strs(documents);
+        let words = build_words(&str_count);
         let pair_stats = build_pair_stats(&words);
         let heap = build_pair_heap(&pair_stats);
         let id_to_bytes = (0u8..=255).map(|b| vec![b]).collect();
@@ -242,5 +239,34 @@ impl BpeTrainer {
         }
         out.flush().expect("flush vocab");
         eprintln!("wrote {n} tokens to {}", path.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_documents_counts_pieces_and_preserves_boundaries() {
+        let documents = ["ab cd", "ab cd"].into_iter().map(String::from);
+        let mut trainer = BpeTrainer::from_documents(documents);
+        let counts: AHashMap<String, i64> = trainer
+            .words
+            .iter()
+            .map(|word| {
+                let bytes: Vec<u8> = word.ids.iter().map(|&id| id as u8).collect();
+                (String::from_utf8(bytes).unwrap(), word.count)
+            })
+            .collect();
+        assert_eq!(
+            counts,
+            AHashMap::from_iter([("ab".into(), 2), (" cd".into(), 2)])
+        );
+
+        trainer.train(259);
+        assert_eq!(
+            trainer.id_to_bytes[256..],
+            [b" c".to_vec(), b"ab".to_vec(), b" cd".to_vec()]
+        );
     }
 }

@@ -1,115 +1,100 @@
+"""Causal GPT with value embeddings and smear; FP32 storage/BF16 computation."""
+
+from __future__ import annotations
+import math
+from contextlib import nullcontext
+from typing import Any, Iterable
 import torch
-from torch import Tensor
-from torch import nn
+from torch import Tensor, nn
 import torch.nn.functional as F
+from nanochat.config import GPTConfig
+from nanochat.optim import MuonAdamW
 
-from nanochat.optim import AdamWGroup, MuonGroup, ParamGroup
+
+def norm(x: Tensor) -> Tensor:
+    return F.rms_norm(x.float(), (x.size(-1),)).to(x.dtype)
 
 
+def resolve_runtime(dtype: str = "auto") -> tuple[torch.device, torch.dtype]:
+    """Training and generation require CUDA; never fall back to CPU."""
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA GPU is required; check the NVIDIA driver and CUDA-enabled PyTorch")
+    supported = torch.cuda.is_bf16_supported()
+    if dtype == "bf16" and not supported:
+        raise ValueError("BF16 requested but unsupported; use dtype=fp32")
+    return torch.device("cuda"), torch.bfloat16 if supported and dtype != "fp32" else torch.float32
 
-class GPTConfig:
-    def __init__(self, n_layer: int) -> None:
-        self.n_layer = n_layer
-        self.aspect_ratio = 64
-        self.vocab_size = 1 << 15
-        self.sequence_len = 2048
-        self.head_dim = 128
-        self.batch = 4
-        self.softcap = 15
-        self.n_embd = self.aspect_ratio * self.n_layer
-        self.n_kv_head = self.n_embd // self.head_dim
+
+def autocast_context(device: torch.device, dtype: torch.dtype):
+    return torch.autocast(device_type=device.type, dtype=dtype) if dtype == torch.bfloat16 else nullcontext()
 
 
 class MLP(nn.Module):
-    def __init__(self, n_embd: int) -> None:
+    def __init__(self, n_embd: int):
         super().__init__()
         self.fc1 = nn.Linear(n_embd, 4 * n_embd, bias=False)
         self.fc2 = nn.Linear(4 * n_embd, n_embd, bias=False)
 
-    def forward(self, x: Tensor) -> Tensor:
-        x = self.fc1(x)
-        x = F.relu(x) ** 2
-        x = self.fc2(x)
-        return x
-
-
-def norm(x: Tensor) -> Tensor:
-    return F.rms_norm(x, (x.size(-1),))
+    def forward(self, x):
+        return self.fc2(F.relu(self.fc1(x)).square())
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, n_embd: int, head_dim: int, n_kv_head: int, has_ve: bool = False) -> None:
+    def __init__(self, n_embd: int, head_dim: int, n_kv_head: int, has_ve: bool = False):
         super().__init__()
         self.head_dim = head_dim
         self.W_q = nn.Linear(n_embd, n_embd, bias=False)
         self.W_k = nn.Linear(n_embd, n_kv_head * head_dim, bias=False)
         self.W_v = nn.Linear(n_embd, n_kv_head * head_dim, bias=False)
-        # attention 输出与 Q 同宽：n_head * head_dim == n_embd
         self.W_o = nn.Linear(n_embd, n_embd, bias=False)
-        if has_ve:
-            self.ve_gate_channels = 12
-            self.ve_gate = nn.Linear(self.ve_gate_channels, n_kv_head, bias=False)
+        self.ve_gate_channels = 12
+        self.ve_gate = nn.Linear(12, n_kv_head, bias=False) if has_ve else None
 
-    def apply_rope(self, x, cos, sin) -> Tensor:
-        # x: [B,T,H,D],cos/sin:[1,T,1,D/2]
-        mid = self.head_dim // 2
-        x1 = x[..., :mid]
-        x2 = x[..., mid:]
-        y1 = x1 * cos - x2 * sin
-        y2 = x1 * sin + x2 * cos
-        return torch.concat((y1, y2), dim=-1)
+    def apply_rope(self, x, cos, sin):
+        x1, x2 = x.chunk(2, dim=-1)
+        cos, sin = cos.to(x.dtype), sin.to(x.dtype)
+        return torch.cat((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
 
-    def forward(self, x: Tensor, cos: Tensor, sin: Tensor, ve: Tensor | None = None) -> Tensor:
-        # x:[B,T,n_embd]
-        B, T, _ = x.shape
-        # q:[B,T,n_head,head_dim]
-        q = self.W_q(x).view(B, T, -1, self.head_dim)
-        q = self.apply_rope(q, cos, sin)
-        # k,v:[B,T,n_kv_head,head_dim]
-        k = self.W_k(x).view(B, T, -1, self.head_dim)
-        k = self.apply_rope(k, cos, sin)
-        v = self.W_v(x).view(B, T, -1, self.head_dim)
+    def forward(self, x, cos, sin, ve = None):
+        b, t, _ = x.shape
+        q = self.apply_rope(self.W_q(x).reshape(b, t, -1, self.head_dim), cos, sin)
+        k = self.apply_rope(self.W_k(x).reshape(b, t, -1, self.head_dim), cos, sin)
+        v = self.W_v(x).reshape(b, t, -1, self.head_dim)
         if ve is not None:
-            # gate:[B,T,n_kv_head],v:[B,T,n_kv_head,head_dim]
-            gate = 3 * F.sigmoid(self.ve_gate(x[..., : self.ve_gate_channels]))
-            ve = ve.view(B, T, -1, self.head_dim)
-            v = v + gate.unsqueeze(-1) * ve
-        a = F.scaled_dot_product_attention(
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
-            is_causal=True,
-            enable_gqa=True,
+            if self.ve_gate is None:
+                raise ValueError("value embeddings require a value gate")
+            gate = 3 * torch.sigmoid(self.ve_gate(x[..., :12]))
+            v = v + gate.unsqueeze(-1) * ve.reshape(b, t, -1, self.head_dim).to(v.dtype)
+        y = F.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True, enable_gqa=True
         )
-
-        # a:[B,T,n_embd]
-        a = a.transpose(1, 2).contiguous().view(B, T, -1)
-        return self.W_o(a)
+        return self.W_o(y.transpose(1, 2).contiguous().reshape(b, t, -1))
 
 
-class TranformerBlock(nn.Module):
-    def __init__(self, n_embd: int, head_dim: int, n_kv_head: int, has_ve: bool = False) -> None:
+class TransformerBlock(nn.Module):
+    def __init__(self, n_embd, head_dim, n_kv_head, has_ve=False):
         super().__init__()
         self.atten = CausalSelfAttention(n_embd, head_dim, n_kv_head, has_ve)
         self.mlp = MLP(n_embd)
 
-    def forward(self, x: Tensor, cos: Tensor, sin: Tensor, ve: Tensor | None = None) -> Tensor:
+    def forward(self, x, cos, sin, ve=None):
         x = x + self.atten(norm(x), cos, sin, ve)
-        x = x + self.mlp(norm(x))
-        return x
+        return x + self.mlp(norm(x))
 
 
 def has_ve(layer_idx: int, n_layer: int) -> bool:
-    """隔层启用 value embedding，最后一层一定有。"""
     return layer_idx % 2 == (n_layer - 1) % 2
 
 
 class Transformer(nn.Module):
-    def __init__(self, vocab_size: int, n_embd: int, head_dim: int, n_kv_head: int, n_layer: int) -> None:
+    def __init__(self, config: GPTConfig):
         super().__init__()
-        self.wte = nn.Embedding(vocab_size, n_embd)
+        self.wte = nn.Embedding(config.vocab_size, config.n_embd)
         self.h = nn.ModuleList(
-            [TranformerBlock(n_embd, head_dim, n_kv_head, has_ve=has_ve(i, n_layer)) for i in range(n_layer)]
+            [
+                TransformerBlock(config.n_embd, config.head_dim, config.n_kv_head, has_ve(i, config.n_layer))
+                for i in range(config.n_layer)
+            ]
         )
 
 
@@ -117,141 +102,174 @@ class GPT(nn.Module):
     cos: Tensor
     sin: Tensor
 
-    def __init__(
-        self,
-        sequence_len: int,
-        vocab_size: int,
-        n_embd: int,
-        head_dim: int,
-        n_kv_head: int,
-        n_layer: int,
-    ) -> None:
+    def __init__(self, config: GPTConfig):
         super().__init__()
-        self.sequence_len = sequence_len
-        self.head_dim = head_dim
-        self.n_layer = n_layer
-        kv_dim = n_kv_head * head_dim
-
-        self.transformer = Transformer(vocab_size, n_embd, head_dim, n_kv_head, n_layer)
-        # 每层（若启用）一张表：token id → value 向量
+        self.config = config
+        self.sequence_len, self.head_dim, self.n_layer = config.sequence_len, config.head_dim, config.n_layer
+        self.transformer = Transformer(config)
         self.value_embeds = nn.ModuleDict(
-            {str(i): nn.Embedding(vocab_size, kv_dim) for i in range(n_layer) if has_ve(i, n_layer)}
+            {
+                str(i): nn.Embedding(config.vocab_size, config.n_kv_head * config.head_dim)
+                for i in range(config.n_layer)
+                if has_ve(i, config.n_layer)
+            }
         )
-        # 每层一个标量：混入初始 embedding；真实初值可在 init_weights 里再设
-        self.x0_lambdas = nn.Parameter(torch.zeros(n_layer))
-        self.resid_lambdas = nn.Parameter(torch.ones(n_layer))
-        # Smear：全局一份，用前一 token 的 embedding 混进当前位（廉价 bigram）
+        self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
+        self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.smear_gate = nn.Linear(24, 1, bias=False)
         self.smear_lambda = nn.Parameter(torch.zeros(1))
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        channel = torch.arange(0, config.head_dim, 2, dtype=torch.float32)
+        freqs = torch.outer(
+            torch.arange(config.sequence_len, dtype=torch.float32), 100000 ** (-channel / config.head_dim)
+        )
+        self.register_buffer("cos", freqs.cos()[None, :, None, :], persistent=False)
+        self.register_buffer("sin", freqs.sin()[None, :, None, :], persistent=False)
+        self.init_weights()
 
-        cos, sin = self._precompute_rope()
-        self.register_buffer("cos", cos, persistent=False)
-        self.register_buffer("sin", sin, persistent=False)
-        self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
+    @torch.no_grad()
+    def init_weights(self):
+        nn.init.normal_(self.transformer.wte.weight, std=0.8)
+        nn.init.normal_(self.lm_head.weight, std=0.001)
+        bound = math.sqrt(3) * self.config.n_embd**-0.5
+        for block in self.transformer.h:
+            if not isinstance(block, TransformerBlock):
+                raise TypeError("expected TransformerBlock in transformer.h")
+            for layer in (block.atten.W_q, block.atten.W_k, block.atten.W_v):
+                nn.init.uniform_(layer.weight, -bound, bound)
+            nn.init.zeros_(block.atten.W_o.weight)
+            nn.init.uniform_(block.mlp.fc1.weight, -bound * 0.4, bound * 0.4)
+            nn.init.zeros_(block.mlp.fc2.weight)
+            if block.atten.ve_gate is not None:
+                nn.init.uniform_(block.atten.ve_gate.weight, 0.0, 0.02)
+        for table in self.value_embeds.values():
+            if not isinstance(table, nn.Embedding):
+                raise TypeError("expected Embedding in value_embeds")
+            nn.init.uniform_(table.weight, -bound, bound)
+        for i in range(self.n_layer):
+            self.resid_lambdas[i] = 1.15 - 0.1 * i / max(self.n_layer - 1, 1)
+            self.x0_lambdas[i] = 0.2 - 0.15 * i / max(self.n_layer - 1, 1)
+        nn.init.zeros_(self.smear_lambda)
+        nn.init.uniform_(self.smear_gate.weight, 0.0, 0.02)
 
-    def _precompute_rope(self) -> tuple[Tensor, Tensor]:
-        channel = torch.arange(0, self.head_dim, 2, dtype=torch.float32)
-        inv_freq = 1.0 / (100000 ** (channel / self.head_dim))
-        t = torch.arange(self.sequence_len, dtype=torch.float32)
-        freqs = torch.outer(t, inv_freq)
-        cos = freqs.cos()  # (T, head_dim/2)
-        sin = freqs.sin()
-        # (1, T, 1, head_dim/2)，广播到 (B, T, H, D/2)
-        cos = cos[None, :, None, :]
-        sin = sin[None, :, None, :]
-        return cos, sin
+    def param_counts(self) -> dict[str, int]:
+        count = lambda module: sum(p.numel() for p in module.parameters())
+        counts = dict(
+            wte=count(self.transformer.wte),
+            transform_matrix=count(self.transformer.h),
+            value_embeds=count(self.value_embeds),
+            lm_head=count(self.lm_head),
+            resid_lambdas=self.resid_lambdas.numel(),
+            x0_lambdas=self.x0_lambdas.numel(),
+            smear_gate=count(self.smear_gate),
+            smear_lambda=self.smear_lambda.numel(),
+        )
+        total = sum(p.numel() for p in self.parameters())
+        assert sum(counts.values()) == total
+        return {**counts, "total": total}
 
-    def param_counts(self) -> dict:
-        """返回各模块参数量。"""
-
-        def nparams(module: nn.Module | nn.Parameter) -> int:
-            if isinstance(module, nn.Parameter):
-                return module.numel()
-            return sum(p.numel() for p in module.parameters())
-
-        counts = {
-            "wte": nparams(self.transformer.wte),
-            "transform_matrix": nparams(self.transformer.h),
-            "value_embeds": nparams(self.value_embeds),
-            "resid_lambdas": nparams(self.resid_lambdas),
-            "x0_lambdas": nparams(self.x0_lambdas),
-            "smear_gate": nparams(self.smear_gate),
-            "smear_lambda": nparams(self.smear_lambda),
-            "lm_head": nparams(self.lm_head),
+    def module_report(self) -> dict:
+        return {
+            name: {"params": sum(p.numel() for p in module.parameters(recurse=False))}
+            for name, module in self.named_modules()
+            if list(module.parameters(recurse=False))
         }
-        counts["total"] = nparams(self)
-        return counts
 
-    def set_optim(self):
-        param_groups: list[ParamGroup] = [
-            AdamWGroup(
-                kind="adamw",
-                params=list(self.transformer.wte.parameters()),
-                lr=0.01,
-                betas=(0.8, 0.96),
-                eps=1e-10,
-                weight_decay=0.1,
-            ),
-            AdamWGroup(
-                kind="adamw",
-                params=list(self.value_embeds.parameters()),
-                lr=0.01,
-                betas=(0.8, 0.96),
-                eps=1e-10,
-                weight_decay=0.1,
-            ),
-            AdamWGroup(
-                kind="adamw",
-                params=list(self.lm_head.parameters()),
-                lr=0.01,
-                betas=(0.8, 0.96),
-                eps=1e-10,
-                weight_decay=0.1,
-            ),
-            AdamWGroup(
-                kind="adamw", params=[self.resid_lambdas], lr=0.01, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.1
-            ),
-            AdamWGroup(kind="adamw", params=[self.x0_lambdas], lr=0.01, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.1),
-            AdamWGroup(
-                kind="adamw",
-                params=list(self.smear_gate.parameters()),
-                lr=0.01,
-                betas=(0.8, 0.96),
-                eps=1e-10,
-                weight_decay=0.1,
-            ),
-            AdamWGroup(
-                kind="adamw", params=[self.smear_lambda], lr=0.01, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.1
-            ),
-        ]
-        matrix_params = list(self.transformer.h.parameters())
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
-            param_groups.append(
-                MuonGroup(kind="muon", params=group_params, lr=0.02, beta=0.95, eps=1e-10, ns_steps=5, weight_decay=0.0)
+    def setup_optimizer(
+        self,
+        *,
+        embedding_lr=0.3,
+        unembedding_lr=0.008,
+        matrix_lr=0.02,
+        scalar_lr=0.5,
+        weight_decay=0.28,
+        batch_lr_scale=1.0,
+        use_bf16=False,
+    ) -> MuonAdamW:
+        width_scale = (self.config.n_embd / 768) ** -0.5
+
+        def adam(params: Iterable[Tensor], lr: float, betas: tuple[float, float], wd: float) -> dict[str, Any]:
+            return dict(
+                kind="adamw", params=list(params), lr=lr * batch_lr_scale, betas=betas, eps=1e-10, weight_decay=wd
             )
 
-    def forward(self, idx: Tensor) -> Tensor:
-        # idx: (B, T) token ids
-        B, T = idx.shape
-        assert T <= self.sequence_len
-        cos = self.cos[:, :T]
-        sin = self.sin[:, :T]
+        groups: list[dict[str, Any]] = [
+            adam(self.lm_head.parameters(), unembedding_lr * width_scale, (0.8, 0.96), 0.01),
+            adam(self.transformer.wte.parameters(), embedding_lr * width_scale, (0.8, 0.995), 0.001),
+            adam(self.value_embeds.parameters(), embedding_lr * width_scale * 0.5, (0.8, 0.995), 0.01),
+            adam([self.resid_lambdas], scalar_lr * 0.01, (0.8, 0.95), 0.05),
+            adam([self.x0_lambdas], scalar_lr, (0.96, 0.95), 0.0),
+            adam([self.smear_gate.weight, self.smear_lambda], 0.2, (0.8, 0.95), 0.0),
+        ]
+        matrices = list(self.transformer.h.parameters())
+        for shape in sorted({p.shape for p in matrices}):
+            groups.append(
+                dict(
+                    kind="muon",
+                    params=[p for p in matrices if p.shape == shape],
+                    lr=matrix_lr * batch_lr_scale,
+                    momentum=0.95,
+                    beta2=0.9,
+                    ns_steps=5,
+                    weight_decay=weight_decay,
+                )
+            )
+        assigned = [p for g in groups for p in g["params"]]
+        assert len({id(p) for p in assigned}) == len(list(self.parameters())) == len(assigned)
+        return MuonAdamW(groups, use_bf16=use_bf16)
 
-        x = norm(self.transformer.wte(idx))  # (B, T, n_embd)
-        # smear：位置 0 不动；1..T-1 混入上一个 token
-        assert T > 1
-        gate = self.smear_lambda * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
-        x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
-
+    def forward(self, idx: Tensor, targets: Tensor | None = None, loss_reduction: str = "mean") -> Tensor:
+        b, t = idx.shape
+        if not 1 <= t <= self.sequence_len:
+            raise ValueError("sequence length outside model context")
+        x = self.transformer.wte(idx)
+        if torch.is_autocast_enabled(idx.device.type):
+            x = x.to(torch.get_autocast_dtype(idx.device.type))
+        x = norm(x)
+        if t > 1:
+            gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
+            x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
         x0 = x
         for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            x = self.resid_lambdas[i].to(x.dtype) * x + self.x0_lambdas[i].to(x.dtype) * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, cos, sin, ve)
-        x = norm(x)
-        logits = self.lm_head(x)
-        return logits
+            x = block(x, self.cos[:, :t], self.sin[:, :t], ve)
+        logits = self.lm_head(norm(x)).float()
+        logits = self.config.softcap * torch.tanh(logits / self.config.softcap)
+        if targets is None:
+            return logits
+        loss = F.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]), targets.reshape(-1), reduction=loss_reduction, ignore_index=-1
+        )
+        return loss.reshape(b, t) if loss_reduction == "none" else loss
+
+    @torch.no_grad()
+    def generate(self, tokens: list[int], max_tokens=32, temperature=0.0, generator=None) -> list[int]:
+        if not tokens or temperature < 0 or max_tokens < 0:
+            raise ValueError("invalid generation inputs")
+        result = list(tokens)
+        for _ in range(max_tokens):
+            idx = torch.tensor([result[-self.sequence_len :]], device=self.lm_head.weight.device)
+            logits = self(idx)[0, -1]
+            token = (
+                logits.argmax()
+                if temperature == 0
+                else torch.multinomial(torch.softmax(logits / temperature, dim=-1), 1, generator=generator)[0]
+            )
+            result.append(int(token))
+        return result
 
 
-
+def resource_estimate(model: GPT, train_cfg=None) -> dict:
+    """FP32 weights + gradients + actual-shaped optimizer states, excludes temporaries."""
+    c = model.param_counts()
+    matrices = list(model.transformer.h.parameters())
+    adam = c["total"] - c["transform_matrix"]
+    reduced = sum(max(p.shape) for p in matrices)
+    buffers = sum(b.numel() * b.element_size() for b in model.buffers())
+    fixed = 8 * c["total"] + 8 * adam + 4 * (c["transform_matrix"] + reduced) + buffers
+    return {
+        "parameter_counts": c,
+        "fixed_bytes_estimate": fixed,
+        "excludes": "activations, workspace and temporary updates",
+    }

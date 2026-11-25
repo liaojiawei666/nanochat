@@ -1,71 +1,75 @@
+use crate::bpe::{BpeEncoder, TokenId};
+use crate::dataset::Dataset;
+use crate::{paths, special};
+use rayon::prelude::*;
 use std::{
-    fs::File,
+    fs::{self, File},
     io::{BufWriter, Write},
     path::Path,
 };
 
-use rayon::prelude::*;
-
-use crate::bpe::{BpeEncoder, TokenId};
-use crate::dataset::{Dataset, DatasetOptions, Split};
-use crate::paths;
-
 fn write_shard_bin(encoder: &BpeEncoder, out_dir: &Path, shard_idx: usize, docs: &[String]) {
-    if docs.is_empty() {
-        return;
-    }
-
+    assert!(!docs.is_empty(), "shard {shard_idx} contains no documents");
     let encoded: Vec<Vec<TokenId>> = docs.par_iter().map(|doc| encoder.encode(doc)).collect();
-
-    let path = out_dir.join(format!("shard_{shard_idx:05}.bin"));
-    let mut out = BufWriter::new(File::create(&path).unwrap_or_else(|e| {
-        panic!("create {}: {e}", path.display());
-    }));
+    let name = format!("shard_{shard_idx:05}.bin");
+    let path = out_dir.join(&name);
+    let temporary = out_dir.join(format!("{name}.part"));
+    let mut out = BufWriter::new(File::create(&temporary).expect("create token shard"));
     for ids in &encoded {
-        for &id in ids {
+        // 文档边界由数据格式决定，BPE 编码器只处理正文。
+        for id in std::iter::once(special::SpecialToken::Bos.id()).chain(ids.iter().copied()) {
             assert!(id <= u16::MAX as u32, "token id {id} does not fit in u16");
-            out.write_all(&(id as u16).to_le_bytes())
-                .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+            let bytes = (id as u16).to_le_bytes();
+            out.write_all(&bytes).expect("write tokens");
         }
     }
-    out.flush()
-        .unwrap_or_else(|e| panic!("flush {}: {e}", path.display()));
+    out.flush().expect("flush token shard");
+    out.get_ref().sync_all().expect("sync token shard");
+    fs::rename(temporary, &path).expect("publish token shard");
     eprintln!("wrote {} docs -> {}", docs.len(), path.display());
 }
 
 pub fn run() {
-    let encoder = BpeEncoder::from_tiktoken_path(&paths::vocab_tiktoken_path());
-
+    let vocab_path = paths::vocab_tiktoken_path();
+    let vocab = fs::read(&vocab_path).expect("read tokenizer");
+    let encoder = BpeEncoder::from_tiktoken_path(&vocab_path);
     let out_dir = paths::token_bin_dir();
-    std::fs::create_dir_all(&out_dir).unwrap_or_else(|e| {
-        panic!("create dir {}: {e}", out_dir.display());
-    });
-
-    let mut cur_shard: Option<usize> = None;
-    let mut docs: Vec<String> = Vec::new();
-
-    let finish_shard = |shard_idx: usize, docs: &mut Vec<String>| {
-        write_shard_bin(&encoder, &out_dir, shard_idx, docs);
-        docs.clear();
-    };
-
-    for sample in Dataset::new(DatasetOptions::new(Split::Train)) {
-        if cur_shard != Some(sample.shard_idx) {
-            if let Some(prev) = cur_shard {
-                finish_shard(prev, &mut docs);
-            }
-            cur_shard = Some(sample.shard_idx);
-        }
-        assert_eq!(
-            sample.doc_idx,
-            docs.len(),
-            "shard {}: doc order broken at doc_idx={}",
-            sample.shard_idx,
-            sample.doc_idx
-        );
-        docs.push(sample.text);
+    let all_paths = paths::list_all_shard_paths();
+    assert!(all_paths.len() >= 2, "need at least two parquet shards");
+    assert!(
+        !out_dir.exists()
+            || fs::read_dir(&out_dir)
+                .expect("read token directory")
+                .next()
+                .is_none(),
+        "token directory is not empty; choose a new NANOCHAT_TOKEN_DIR"
+    );
+    // 全部分片和词表先写入相邻临时目录，完成后一次性发布。
+    let mut temporary_name = out_dir
+        .file_name()
+        .expect("token directory needs a name")
+        .to_os_string();
+    temporary_name.push(".part");
+    let stage = out_dir.with_file_name(temporary_name);
+    fs::create_dir_all(out_dir.parent().unwrap()).expect("create token directory parent");
+    if stage.exists() {
+        fs::remove_dir_all(&stage).expect("remove stale temporary token directory");
     }
-    if let Some(shard_idx) = cur_shard {
-        finish_shard(shard_idx, &mut docs);
+    fs::create_dir(&stage).expect("create temporary token directory");
+    for (index, path) in all_paths.iter().enumerate() {
+        let docs: Vec<String> = Dataset::new(vec![path.clone()]).collect();
+        write_shard_bin(&encoder, &stage, index, &docs);
     }
+    assert_eq!(
+        vocab,
+        fs::read(vocab_path).expect("read tokenizer"),
+        "tokenizer changed while encoding"
+    );
+    let mut file = File::create(stage.join("vocab.tiktoken")).expect("create tokenizer");
+    file.write_all(&vocab).expect("write tokenizer");
+    file.sync_all().expect("sync tokenizer");
+    if out_dir.exists() {
+        fs::remove_dir(&out_dir).expect("remove empty token directory");
+    }
+    fs::rename(stage, out_dir).expect("publish token directory");
 }
